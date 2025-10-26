@@ -60,8 +60,6 @@ func (c *Cache[K, V]) Get(k K) (value *V, ok bool) {
 
 	v := wp.Value()
 	if v == nil {
-		// Weak pointer was collected, clean up the entry
-		c.shardedMap.Del(k)
 		return nil, false
 	}
 
@@ -80,16 +78,13 @@ func (c *Cache[K, V]) Set(k K, v *V) (Prev *V, ok bool) {
 
 	wp := weak.Make(v)
 
-	// Verify weak pointer value is not nil before adding cleanup
-	if ptr := wp.Value(); ptr != nil {
-		runtime.AddCleanup[V, K](
-			v,
-			func(k K) {
-				c.Del(k)
-			},
-			k,
-		)
-	}
+	runtime.AddCleanup[V, K](
+		v,
+		func(k K) {
+			c.Del(k)
+		},
+		k,
+	)
 
 	oldWP, ok := c.shardedMap.Set(k, wp)
 	if !ok {
