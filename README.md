@@ -6,6 +6,8 @@
 A thread-safe weakpointer cache that automatically cleans keys deleted weakpointer values without fancy background mechanics. It
 simplifies weakpointer map cleanup and provides shrinking maps vs. non-shrinking.
 
+**NOTE** While you can use the code here, the code is simply for an article.
+
 # Introduction
 
 This package introduces a cache that:
@@ -66,3 +68,11 @@ The code here is simplistic, relying on recent advancements in the Go standard l
 spent time trying to optimize benchmarks. I'm sure there are numerous enhancements that could be done. I have a few cases where this will be useful as it is.
 
 If your looking for an LRU, I like this one: https://github.com/tidwall/tinylru .
+
+# Benchmark notes
+
+I benchmarked these in a separate repo. Performance is less than things like bigcache in high concurrenct scenarios, sometimes in multiples slower.  In single cache fetches its several times faster.
+
+But overall, its hard to get a feel for how much overhead the runtime is going to add vs the collection times that are inherent in other caches.  A lot of this is also going to depend on how often the GC is running.  Weakpointers and cleanup calls are going to cost more in the runtime.
+
+Micro benchmarks are going to be hard to tell what the overall effect on a system is going to be. Trying under realistic conditions for your service is going to give you the best watermarks on performance (cpu/memory/latency).

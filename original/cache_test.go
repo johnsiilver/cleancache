@@ -358,6 +358,55 @@ func TestWeakPointerCleanup(t *testing.T) {
 	}
 }
 
+func TestNilCacheOperations(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation func(*Cache[string, testValue]) (any, bool)
+		wantValue any
+		wantOk    bool
+	}{
+		{
+			name: "Success: Set on nil cache returns nil, false",
+			operation: func(c *Cache[string, testValue]) (any, bool) {
+				val := &testValue{data: "test", num: 42}
+				return c.Set("key1", val)
+			},
+			wantValue: (*testValue)(nil),
+			wantOk:    false,
+		},
+		{
+			name: "Success: Del on nil cache returns nil, false",
+			operation: func(c *Cache[string, testValue]) (any, bool) {
+				return c.Del("key1")
+			},
+			wantValue: (*testValue)(nil),
+			wantOk:    false,
+		},
+		{
+			name: "Success: Get on nil cache returns nil, false",
+			operation: func(c *Cache[string, testValue]) (any, bool) {
+				return c.Get("key1")
+			},
+			wantValue: (*testValue)(nil),
+			wantOk:    false,
+		},
+	}
+
+	for _, test := range tests {
+		var cache *Cache[string, testValue]
+
+		gotValue, gotOk := test.operation(cache)
+
+		if gotOk != test.wantOk {
+			t.Errorf("TestNilCacheOperations(%s): got ok=%v, want ok=%v", test.name, gotOk, test.wantOk)
+		}
+
+		if diff := pretty.Compare(gotValue, test.wantValue); diff != "" {
+			t.Errorf("TestNilCacheOperations(%s): -got +want:\n%s", test.name, diff)
+		}
+	}
+}
+
 func TestWeakPointerCollectedCleanup(t *testing.T) {
 	tests := []struct {
 		name string
