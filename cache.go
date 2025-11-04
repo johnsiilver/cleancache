@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/gostdlib/base/context"
+
 	"github.com/johnsiilver/cleancache/internal/shardmap"
 	"github.com/johnsiilver/cleancache/internal/shardmap/hashmap"
+	"github.com/johnsiilver/cleancache/internal/singleflight"
 )
 
 type ttlEntry[V any] struct {
@@ -25,17 +27,21 @@ type ttlEntry[V any] struct {
 
 // Cache is a weak pointer cache.
 type Cache[K comparable, V any] struct {
-	m        shardmap.Map[K, V]
-	ttl      time.Duration
-	interval time.Duration
+	m          shardmap.Map[K, V]
+	ttl        time.Duration
+	interval   time.Duration
+	useFlights bool
+	getFlight  singleflight.Group[K, struct{}]
+	setFlight  singleflight.Group[K, struct{}]
 
 	ttlLock sync.Mutex
 	ttlMap  hashmap.Map[K, ttlEntry[V]]
 }
 
 type opts struct {
-	ttl      time.Duration
-	interval time.Duration
+	ttl        time.Duration
+	interval   time.Duration
+	useFlights bool
 }
 
 // Option is an option for New().
@@ -59,6 +65,17 @@ func WithTTL(ttl, interval time.Duration) Option {
 	}
 }
 
+// WithSingleFlight enables the use of the singleflight package for Get operations.
+// This adds another lock on Get operations, but prevents multiple concurrent
+// Get calls for the same key from causing multiple loads of the same value. Use this to
+// prevent thundering herd problems when loading values from the cache.
+func WithSingleFlight[K comparable, V any]() Option {
+	return func(o opts) (opts, error) {
+		o.useFlights = true
+		return o, nil
+	}
+}
+
 // New creates a new Cache with the given options.
 func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K, V], error) {
 	o := opts{}
@@ -69,7 +86,9 @@ func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K,
 			return nil, err
 		}
 	}
-	c := &Cache[K, V]{}
+	c := &Cache[K, V]{
+		useFlights: o.useFlights,
+	}
 	if o.ttl > 0 {
 		c.ttl = o.ttl
 		c.interval = o.interval
@@ -121,6 +140,11 @@ func (m *Cache[K, V]) Set(k K, v *V) (prev *V, replaced bool) {
 		prev, deleted := m.Del(k)
 		return prev, deleted
 	}
+
+	return m.set(k, v)
+}
+
+func (m *Cache[K, V]) set(k K, v *V) (prev *V, replaced bool) {
 	if m.ttl > 0 {
 		m.ttlLock.Lock()
 		m.ttlMap.Set(k, ttlEntry[V]{hold: time.Now().Add(m.ttl), value: v})
@@ -148,6 +172,16 @@ func (m *Cache[K, V]) Set(k K, v *V) (prev *V, replaced bool) {
 // Get returns a value for a key.
 // Returns false when no value has been assign for key.
 func (m *Cache[K, V]) Get(k K) (value *V, ok bool) {
+	if m.useFlights {
+		_, _, _ = m.getFlight.Do(
+			k,
+			func() (struct{}, error) {
+				value, ok = m.m.Get(k)
+				return struct{}{}, nil // We don't need the value.
+			},
+		)
+		return value, ok
+	}
 	return m.m.Get(k)
 }
 
