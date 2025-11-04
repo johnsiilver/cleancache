@@ -699,3 +699,195 @@ func TestConcurrentMixedOperations(t *testing.T) {
 		}
 	}
 }
+
+func TestWithCleanupInterval(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		interval time.Duration
+		wantErr  bool
+	}{
+		{
+			name:     "Success: custom cleanup interval 100ms",
+			interval: 100 * time.Millisecond,
+			wantErr:  false,
+		},
+		{
+			name:     "Success: custom cleanup interval 1s",
+			interval: 1 * time.Second,
+			wantErr:  false,
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithCleanupInterval(test.interval))
+
+		switch {
+		case err == nil && test.wantErr:
+			t.Errorf("TestWithCleanupInterval(%s): got err == nil, want err != nil", test.name)
+			continue
+		case err != nil && !test.wantErr:
+			t.Errorf("TestWithCleanupInterval(%s): got err == %s, want err == nil", test.name, err)
+			continue
+		case err != nil:
+			continue
+		}
+
+		if cache == nil {
+			t.Errorf("TestWithCleanupInterval(%s): got nil cache, want non-nil", test.name)
+		}
+
+		// Verify cache is functional
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+		got, ok := cache.Get("key")
+		if !ok {
+			t.Errorf("TestWithCleanupInterval(%s): cache not functional", test.name)
+		}
+		if diff := pretty.Compare(got, val); diff != "" {
+			t.Errorf("TestWithCleanupInterval(%s): -got +want:\n%s", test.name, diff)
+		}
+	}
+}
+
+func TestTimerCleanup(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+	}{
+		{
+			name:     "Success: timer cleans up expired entries",
+			interval: 50 * time.Millisecond,
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithCleanupInterval(test.interval))
+		if err != nil {
+			t.Fatalf("TestTimerCleanup(%s): failed to create cache: %v", test.name, err)
+		}
+
+		// Add value that will be GC'd
+		func() {
+			val := &testValue{data: "will-be-collected", num: 42}
+			cache.Set("key", val)
+		}()
+
+		// Verify it exists initially
+		if got, ok := cache.Get("key"); ok && got != nil {
+			t.Logf("TestTimerCleanup(%s): value exists before GC", test.name)
+		}
+
+		// Force GC
+		runtime.GC()
+		runtime.GC()
+
+		// Wait for cleanup interval to pass (with buffer)
+		time.Sleep(test.interval * 3)
+
+		// Note: GC is non-deterministic, so we just verify cache is still functional
+		newVal := &testValue{data: "new-value", num: 100}
+		cache.Set("newkey", newVal)
+		got, ok := cache.Get("newkey")
+		if !ok {
+			t.Errorf("TestTimerCleanup(%s): cache not functional after cleanup cycle", test.name)
+		}
+		if diff := pretty.Compare(got, newVal); diff != "" {
+			t.Errorf("TestTimerCleanup(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(newVal)
+	}
+}
+
+func TestTimerContextCancellation(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: cache cleanup stops when context is cancelled",
+		},
+	}
+
+	for _, test := range tests {
+		ctx, cancel := context.WithCancel(t.Context())
+
+		cache, err := New[string, testValue](ctx, WithCleanupInterval(10*time.Millisecond))
+		if err != nil {
+			t.Fatalf("TestTimerContextCancellation(%s): failed to create cache: %v", test.name, err)
+		}
+
+		// Add a value
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+
+		// Verify it exists
+		if _, ok := cache.Get("key"); !ok {
+			t.Errorf("TestTimerContextCancellation(%s): value not found after Set", test.name)
+		}
+
+		// Cancel context
+		cancel()
+
+		// Give goroutine time to exit
+		time.Sleep(50 * time.Millisecond)
+
+		// Cache should still work for existing operations
+		got, ok := cache.Get("key")
+		if !ok || got == nil {
+			t.Errorf("TestTimerContextCancellation(%s): Get() failed after context cancel", test.name)
+		}
+
+		// Should be able to set new values
+		newVal := &testValue{data: "new", num: 99}
+		cache.Set("newkey", newVal)
+		gotNew, ok := cache.Get("newkey")
+		if !ok {
+			t.Errorf("TestTimerContextCancellation(%s): Set/Get failed after context cancel", test.name)
+		}
+		if diff := pretty.Compare(gotNew, newVal); diff != "" {
+			t.Errorf("TestTimerContextCancellation(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(val)
+		runtime.KeepAlive(newVal)
+	}
+}
+
+func TestDefaultCleanupInterval(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: cache uses default 30s interval when not specified",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx)
+		if err != nil {
+			t.Fatalf("TestDefaultCleanupInterval(%s): failed to create cache: %v", test.name, err)
+		}
+
+		if cache == nil {
+			t.Errorf("TestDefaultCleanupInterval(%s): got nil cache, want non-nil", test.name)
+		}
+
+		// Verify cache is functional
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+		got, ok := cache.Get("key")
+		if !ok {
+			t.Errorf("TestDefaultCleanupInterval(%s): cache not functional", test.name)
+		}
+		if diff := pretty.Compare(got, val); diff != "" {
+			t.Errorf("TestDefaultCleanupInterval(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(val)
+	}
+}

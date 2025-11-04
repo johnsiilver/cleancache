@@ -25,7 +25,7 @@ type Map[K comparable, V any] struct {
 	mus     []sync.RWMutex
 	maps    []*rhh.Map[K, weak.Pointer[V]]
 
-	count atomic.Uint64
+	count atomic.Int64
 
 	seed maphash.Seed
 }
@@ -43,6 +43,8 @@ func (m *Map[K, V]) Clear() {
 	m.initDo()
 	for i := 0; i < m.shards; i++ {
 		m.mus[i].Lock()
+		c := m.count.Load()
+		m.count.Store(c - int64(m.maps[i].Len()))
 		m.maps[i] = rhh.New[K, weak.Pointer[V]](m.cap / m.shards)
 		m.mus[i].Unlock()
 	}
@@ -60,6 +62,7 @@ func (m *Map[K, V]) Set(key K, value *V) (prev *V, replaced bool) {
 	if replaced && prev != nil {
 		return prev, replaced
 	}
+	m.count.Add(1)
 	return prev, false
 }
 
@@ -92,6 +95,7 @@ func (m *Map[K, V]) Delete(key K) (prev *V, deleted bool) {
 		m.mus[shard].Unlock()
 		return nil, deleted
 	}
+	m.count.Add(-1)
 	prev = wp.Value()
 	if prev == nil {
 		m.mus[shard].Unlock()
@@ -101,6 +105,29 @@ func (m *Map[K, V]) Delete(key K) (prev *V, deleted bool) {
 	return prev, deleted
 }
 
+// DeleteIfNil deletes a value for a key only if the current value's weak pointer is nil.
+func (m *Map[K, V]) DeleteIfNil(key K) (prev *V, deleted bool) {
+	m.initDo()
+	shard := m.choose(key)
+	m.mus[shard].Lock()
+
+	wp, ok := m.maps[shard].Get(key)
+	if !ok {
+		m.mus[shard].Unlock()
+		return nil, false
+	}
+	val := wp.Value()
+	if val != nil {
+		m.mus[shard].Unlock()
+		return nil, false
+	}
+
+	m.maps[shard].Delete(key)
+	m.count.Add(-1)
+	m.mus[shard].Unlock()
+	return val, true
+}
+
 // CleanShards removes all entries with nil values from the map.
 func (m *Map[K, V]) CleanShards() {
 	m.initDo()
@@ -108,7 +135,9 @@ func (m *Map[K, V]) CleanShards() {
 		m.mus[shard].Lock()
 		for k, v := range m.maps[shard].All() {
 			if v.Value() == nil {
-				m.maps[shard].Delete(k)
+				if _, deleted := m.maps[shard].Delete(k); deleted {
+					m.count.Add(-1)
+				}
 			}
 		}
 		m.mus[shard].Unlock()
@@ -119,16 +148,10 @@ func (m *Map[K, V]) CleanShards() {
 // have not yet been cleaned up.
 func (m *Map[K, V]) Len() int {
 	m.initDo()
-	var len int
-	for i := 0; i < m.shards; i++ {
-		m.mus[i].Lock()
-		len += m.maps[i].Len()
-		m.mus[i].Unlock()
-	}
-	return len
+	return int(m.count.Load())
 }
 
-// All returns a sequence of all key/values. It is not safe to call
+// all returns a sequence of all key/values. It is not safe to call
 // Set or Delete while iterating.
 func (m *Map[K, V]) all() iter.Seq2[K, *V] {
 	m.initDo()

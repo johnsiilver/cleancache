@@ -16,7 +16,6 @@ import (
 // This cache is thread-safe.
 type Cache[K comparable, V any] struct {
 	shardedMap *shardmap.Map[K, V]
-	lastClean  time.Time
 }
 
 type opts struct {
@@ -37,7 +36,7 @@ func WithCleanupInterval(d time.Duration) Option {
 
 // New creates a new Cache with the given options.
 func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K, V], error) {
-	o := opts{}
+	o := opts{cleanupInterval: 30 * time.Second}
 	for _, option := range options {
 		var err error
 		o, err = option(o)
@@ -48,10 +47,9 @@ func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K,
 
 	c := &Cache[K, V]{
 		shardedMap: &shardmap.Map[K, V]{},
-		lastClean:  time.Now(),
 	}
 
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(o.cleanupInterval)
 	ctx, cancel := context.WithCancel(ctx)
 	_ = context.Pool(ctx).Submit(
 		ctx,
@@ -107,7 +105,8 @@ func (c *Cache[K, V]) Set(k K, v *V) (Prev *V, ok bool) {
 	return c.shardedMap.Set(k, v)
 }
 
-// delete removes a planID from the cache.
+// Del deletes a value for a key.
+// Returns the deleted value, or false when no value was assigned.
 func (c *Cache[K, V]) Del(k K) (prev *V, ok bool) {
 	if c == nil || c.shardedMap == nil {
 		return

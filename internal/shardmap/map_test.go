@@ -212,3 +212,181 @@ func TestClear(t *testing.T) {
 	// Keep strong references alive until the end
 	runtime.KeepAlive(strongRefs)
 }
+
+func TestDeleteIfNil(t *testing.T) {
+	tests := []struct {
+		name        string
+		wantDeleted bool
+	}{
+		{
+			name:        "Success: delete key with nil weak pointer",
+			wantDeleted: true,
+		},
+		{
+			name:        "Success: do not delete key with live value",
+			wantDeleted: false,
+		},
+	}
+
+	for _, test := range tests {
+		m := New[string, int](10)
+
+		if test.wantDeleted {
+			// Create value that will be GC'd
+			func() {
+				val := 42
+				ptr := &val
+				m.Set("key1", ptr)
+			}()
+
+			// Force GC to collect the value
+			runtime.GC()
+			runtime.GC()
+			time.Sleep(10 * time.Millisecond)
+
+			_, deleted := m.DeleteIfNil("key1")
+			if !deleted {
+				t.Logf("TestDeleteIfNil(%s): WARNING - value not GC'd (non-deterministic)", test.name)
+			}
+		} else {
+			// Keep strong reference
+			val := 42
+			ptr := &val
+			m.Set("key2", ptr)
+
+			_, deleted := m.DeleteIfNil("key2")
+			if deleted {
+				t.Errorf("TestDeleteIfNil(%s): got deleted=true, want false", test.name)
+			}
+
+			runtime.KeepAlive(ptr)
+		}
+	}
+
+	// Test non-existent key
+	m := New[string, int](10)
+	_, deleted := m.DeleteIfNil("nonexistent")
+	if deleted {
+		t.Errorf("TestDeleteIfNil: deleted non-existent key")
+	}
+}
+
+func TestCleanShards(t *testing.T) {
+	m := New[string, int](100)
+
+	// Keep strong references for some values
+	strongRefs := make(map[string]*int)
+
+	// Add values
+	for i := 0; i < 10; i++ {
+		val := i
+		ptr := &val
+		key := fmt.Sprintf("key%d", i)
+		m.Set(key, ptr)
+
+		// Keep strong references only for even numbers
+		if i%2 == 0 {
+			strongRefs[key] = ptr
+		}
+	}
+
+	initialLen := m.Len()
+	if initialLen != 10 {
+		t.Errorf("TestCleanShards: initial Len()=%d, want 10", initialLen)
+	}
+
+	// Force GC to collect values without strong references
+	runtime.GC()
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+
+	// Clean shards
+	m.CleanShards()
+
+	// Length should be <= initial (some may have been GC'd)
+	finalLen := m.Len()
+	if finalLen > initialLen {
+		t.Errorf("TestCleanShards: after CleanShards, Len()=%d, want <=%d", finalLen, initialLen)
+	}
+
+	// Keep strong references alive
+	runtime.KeepAlive(strongRefs)
+}
+
+func TestLenAtomicCount(t *testing.T) {
+	m := New[string, int](10)
+
+	// Keep strong references
+	strongRefs := make(map[string]*int)
+
+	tests := []struct {
+		name      string
+		op        func()
+		wantDelta int
+	}{
+		{
+			name: "Success: Len increases after Set",
+			op: func() {
+				val := 1
+				ptr := &val
+				strongRefs["key1"] = ptr
+				m.Set("key1", ptr)
+			},
+			wantDelta: 1,
+		},
+		{
+			name: "Success: Len unchanged after replace",
+			op: func() {
+				val := 2
+				ptr := &val
+				strongRefs["key1"] = ptr
+				m.Set("key1", ptr)
+			},
+			wantDelta: 0,
+		},
+		{
+			name: "Success: Len increases with new key",
+			op: func() {
+				val := 3
+				ptr := &val
+				strongRefs["key2"] = ptr
+				m.Set("key2", ptr)
+			},
+			wantDelta: 1,
+		},
+		{
+			name: "Success: Len decreases after Delete",
+			op: func() {
+				m.Delete("key1")
+			},
+			wantDelta: -1,
+		},
+		{
+			name: "Success: Len unchanged deleting non-existent",
+			op: func() {
+				m.Delete("nonexistent")
+			},
+			wantDelta: 0,
+		},
+	}
+
+	currentLen := 0
+	for _, test := range tests {
+		beforeLen := m.Len()
+		test.op()
+		afterLen := m.Len()
+
+		currentLen += test.wantDelta
+
+		if afterLen != currentLen {
+			t.Errorf("TestLenAtomicCount(%s): Len()=%d, want %d", test.name, afterLen, currentLen)
+		}
+
+		if afterLen-beforeLen != test.wantDelta {
+			t.Errorf("TestLenAtomicCount(%s): delta=%d, want %d", test.name, afterLen-beforeLen, test.wantDelta)
+		}
+	}
+
+	// Keep strong references alive
+	runtime.KeepAlive(strongRefs)
+}

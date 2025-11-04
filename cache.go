@@ -8,37 +8,56 @@
 package cleancache
 
 import (
-	"context"
-	"hash/maphash"
-	"iter"
+	"fmt"
 	"runtime"
-	"sync/atomic"
-	"weak"
+	"sync"
+	"time"
 
-	"github.com/gostdlib/base/concurrency/sync"
-	rhh "github.com/johnsiilver/cleancache/internal/shardmap/hashmap"
+	"github.com/gostdlib/base/context"
+	"github.com/johnsiilver/cleancache/internal/shardmap"
+	"github.com/johnsiilver/cleancache/internal/shardmap/hashmap"
 )
 
-// Map is a hashmap. Like map[string]interface{}, but sharded and thread-safe.
-type Cache[K comparable, V any] struct {
-	// IsEqual is a function that determines if two values are equal. This is not required unless using
-	// CompareAndSwap or CompareAndDelete.
-	IsEqual func(old, new V) bool
-	init    sync.Once
-	cap     int
-	shards  int
-	mus     []sync.RWMutex
-	maps    []*rhh.Map[K, weak.Pointer[V]]
-
-	count atomic.Uint64
-
-	seed maphash.Seed
+type ttlEntry[V any] struct {
+	hold  time.Time
+	value *V
 }
 
-type opts struct{}
+// Cache is a weak pointer cache.
+type Cache[K comparable, V any] struct {
+	m        shardmap.Map[K, V]
+	ttl      time.Duration
+	interval time.Duration
+
+	ttlLock sync.Mutex
+	ttlMap  hashmap.Map[K, ttlEntry[V]]
+}
+
+type opts struct {
+	ttl      time.Duration
+	interval time.Duration
+}
 
 // Option is an option for New().
-type Option func(opts) (opts, error)
+type Option func(o opts) (opts, error)
+
+// WithTTL sets the time-to-live for entries in the cache and the cleanup interval.
+// Entries older than ttl will be removed during cleanup.
+// The cleanup interval must be at least 1 second.
+// If ttl is 0, an error is returned.
+func WithTTL(ttl, interval time.Duration) Option {
+	return func(o opts) (opts, error) {
+		if interval < 1*time.Second {
+			return o, fmt.Errorf("cleanup interval must be at least 1 second")
+		}
+		if ttl == 0 {
+			return o, fmt.Errorf("ttl must be greater than 0")
+		}
+		o.ttl = ttl
+		o.interval = interval
+		return o, nil
+	}
+}
 
 // New creates a new Cache with the given options.
 func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K, V], error) {
@@ -50,31 +69,47 @@ func New[K comparable, V any](ctx context.Context, options ...Option) (*Cache[K,
 			return nil, err
 		}
 	}
-
-	c := &Cache[K, V]{cap: 1024}
-
-	c.shards = runtime.NumCPU() * 16
-	if c.shards%2 == 1 {
-		c.shards++
+	c := &Cache[K, V]{}
+	if o.ttl > 0 {
+		c.ttl = o.ttl
+		c.interval = o.interval
+		_ = context.Pool(ctx).Submit(
+			ctx,
+			func() {
+				c.ttlExpire(ctx)
+			},
+		)
 	}
-
-	scap := c.cap / c.shards
-	c.mus = make([]sync.RWMutex, c.shards)
-	c.maps = make([]*rhh.Map[K, weak.Pointer[V]], c.shards)
-	for i := 0; i < len(c.maps); i++ {
-		c.maps[i] = rhh.New[K, weak.Pointer[V]](scap)
-	}
-	c.seed = maphash.MakeSeed()
 
 	return c, nil
 }
 
-// Clear out all values from map
-func (m *Cache[K, V]) Clear() {
-	for i := 0; i < m.shards; i++ {
-		m.mus[i].Lock()
-		m.maps[i] = rhh.New[K, weak.Pointer[V]](m.cap / m.shards)
-		m.mus[i].Unlock()
+// ttlExpire runs in a background goroutine to clean up expired entries in the ttlMap.
+// This map is holding values with a regular pointer to prevent the weak reference from
+// being collected before the ttl expires. Once the TTL expires, the entry is deleted from the ttlMap,
+// which allows the weak reference in the main map to be collected by the GC if not used.
+func (m *Cache[K, V]) ttlExpire(ctx context.Context) {
+	ticker := time.NewTicker(m.interval)
+	defer ticker.Stop()
+	deletions := []K{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			m.ttlLock.Lock()
+			for k, v := range m.ttlMap.All() {
+				if v.hold.Before(now) {
+					deletions = append(deletions, k)
+				}
+			}
+			for _, k := range deletions {
+				m.ttlMap.Delete(k)
+			}
+			m.ttlLock.Unlock()
+			deletions = deletions[:0]
+		}
 	}
 }
 
@@ -83,94 +118,52 @@ func (m *Cache[K, V]) Clear() {
 // Set a nil value, it is equivalent to Delete.
 func (m *Cache[K, V]) Set(k K, v *V) (prev *V, replaced bool) {
 	if v == nil {
-		return m.Del(k)
+		prev, deleted := m.Del(k)
+		return prev, deleted
 	}
-	shard := m.choose(k)
+	if m.ttl > 0 {
+		m.ttlLock.Lock()
+		m.ttlMap.Set(k, ttlEntry[V]{hold: time.Now().Add(m.ttl), value: v})
+		m.ttlLock.Unlock()
+	}
 
-	n := weak.Make(v)
+	prev, replaced = m.m.Set(k, v)
 	runtime.AddCleanup[V, K](
 		v,
 		func(k K) {
-			m.Del(k)
+			m.m.DeleteIfNil(k)
 		},
 		k,
 	)
-	m.mus[shard].Lock()
-	wp, replaced := m.maps[shard].Set(k, n)
-	m.mus[shard].Unlock()
-	prev = wp.Value()
-	if replaced && prev != nil {
-		return prev, replaced
+
+	if !replaced {
+		return nil, false
 	}
-	return prev, false
+	if prev == nil {
+		return nil, false
+	}
+	return prev, replaced
 }
 
 // Get returns a value for a key.
 // Returns false when no value has been assign for key.
 func (m *Cache[K, V]) Get(k K) (value *V, ok bool) {
-	shard := m.choose(k)
-	m.mus[shard].RLock()
-	wp, ok := m.maps[shard].Get(k)
-	m.mus[shard].RUnlock()
-	if !ok {
-		return nil, false
-	}
-	value = wp.Value()
-	if value == nil {
-		return nil, false
-	}
-	return value, ok
+	return m.m.Get(k)
 }
 
-// Delete deletes a value for a key.
+// Del deletes a value for a key.
 // Returns the deleted value, or false when no value was assigned.
 func (m *Cache[K, V]) Del(k K) (prev *V, deleted bool) {
-	shard := m.choose(k)
-	m.mus[shard].Lock()
-	wp, deleted := m.maps[shard].Delete(k)
-	if !deleted {
-		m.mus[shard].Unlock()
-		return nil, deleted
+	if m.ttl > 0 {
+		m.ttlLock.Lock()
+		m.ttlMap.Delete(k)
+		m.ttlLock.Unlock()
 	}
-	prev = wp.Value()
-	if prev == nil {
-		m.mus[shard].Unlock()
-		return nil, false
-	}
-	m.mus[shard].Unlock()
-	return prev, deleted
+	return m.m.Delete(k)
 }
 
 // Len returns the number of values in map. This is an approximation since keys may hold nil values that
 // have not yet been cleaned up.
 func (m *Cache[K, V]) Len() int {
-	var len int
-	for i := 0; i < m.shards; i++ {
-		m.mus[i].Lock()
-		len += m.maps[i].Len()
-		m.mus[i].Unlock()
-	}
-	return len
-}
-
-// All returns a sequence of all key/values. It is not safe to call
-// Set or Delete while iterating.
-func (m *Cache[K, V]) all() iter.Seq2[K, *V] {
-	return func(yield func(K, *V) bool) {
-		for i := 0; i < m.shards; i++ {
-			for k, wp := range m.maps[i].All() {
-				v := wp.Value()
-				if v == nil {
-					continue
-				}
-				if !yield(k, v) {
-					return
-				}
-			}
-		}
-	}
-}
-
-func (m *Cache[K, V]) choose(key K) int {
-	return int(maphash.Comparable(m.seed, key) & uint64(m.shards-1))
+	return m.m.Len()
 }

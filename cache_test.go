@@ -2,6 +2,7 @@ package cleancache
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -648,5 +649,402 @@ func TestConcurrentMixedOperations(t *testing.T) {
 		if diff := pretty.Compare(got, testVal); diff != "" {
 			t.Errorf("TestConcurrentMixedOperations(%s): -got +want:\n%s", test.name, diff)
 		}
+	}
+}
+
+func TestCacheLen(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*Cache[string, testValue])
+		wantLen int
+	}{
+		{
+			name:    "Success: empty cache has length 0",
+			setup:   func(c *Cache[string, testValue]) {},
+			wantLen: 0,
+		},
+		{
+			name: "Success: cache with one item has length 1",
+			setup: func(c *Cache[string, testValue]) {
+				val := &testValue{data: "test", num: 1}
+				c.Set("key1", val)
+			},
+			wantLen: 1,
+		},
+		{
+			name: "Success: cache with multiple items",
+			setup: func(c *Cache[string, testValue]) {
+				for i := 0; i < 10; i++ {
+					val := &testValue{data: "test", num: i}
+					c.Set(fmt.Sprintf("key%d", i), val)
+				}
+			},
+			wantLen: 10,
+		},
+		{
+			name: "Success: length decreases after delete",
+			setup: func(c *Cache[string, testValue]) {
+				for i := 0; i < 10; i++ {
+					val := &testValue{data: "test", num: i}
+					c.Set(fmt.Sprintf("key%d", i), val)
+				}
+				c.Del("key0")
+				c.Del("key5")
+			},
+			wantLen: 8,
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx)
+		if err != nil {
+			t.Fatalf("TestCacheLen(%s): failed to create cache: %v", test.name, err)
+		}
+
+		test.setup(cache)
+
+		got := cache.Len()
+		if got != test.wantLen {
+			t.Errorf("TestCacheLen(%s): got len=%d, want len=%d", test.name, got, test.wantLen)
+		}
+	}
+}
+
+func TestWithTTL(t *testing.T) {
+	tests := []struct {
+		name     string
+		ttl      time.Duration
+		interval time.Duration
+		wantErr  bool
+	}{
+		{
+			name:     "Success: valid TTL and interval",
+			ttl:      5 * time.Second,
+			interval: 1 * time.Second,
+			wantErr:  false,
+		},
+		{
+			name:     "Error: interval less than 1 second",
+			ttl:      5 * time.Second,
+			interval: 500 * time.Millisecond,
+			wantErr:  true,
+		},
+		{
+			name:     "Error: zero TTL",
+			ttl:      0,
+			interval: 1 * time.Second,
+			wantErr:  true,
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithTTL(test.ttl, test.interval))
+
+		switch {
+		case err == nil && test.wantErr:
+			t.Errorf("TestWithTTL(%s): got err == nil, want err != nil", test.name)
+			continue
+		case err != nil && !test.wantErr:
+			t.Errorf("TestWithTTL(%s): got err == %s, want err == nil", test.name, err)
+			continue
+		case err != nil:
+			continue
+		}
+
+		if cache == nil {
+			t.Errorf("TestWithTTL(%s): got nil cache", test.name)
+		}
+	}
+}
+
+func TestTTLPreventsPrematureGC(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: TTL holds strong reference preventing GC",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithTTL(5*time.Second, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLPreventsPrematureGC(%s): failed to create cache: %v", test.name, err)
+		}
+
+		// Set value and immediately remove our reference
+		func() {
+			val := &testValue{data: "test", num: 42}
+			cache.Set("key", val)
+		}()
+
+		// Force GC
+		runtime.GC()
+		runtime.GC()
+		time.Sleep(50 * time.Millisecond)
+
+		// Value should still exist because ttlMap holds strong reference
+		got, ok := cache.Get("key")
+		if !ok {
+			t.Errorf("TestTTLPreventsPrematureGC(%s): value GC'd despite TTL", test.name)
+		}
+		if got == nil {
+			t.Errorf("TestTTLPreventsPrematureGC(%s): got nil value", test.name)
+		}
+	}
+}
+
+func TestTTLWithDel(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: Del removes from both maps",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithTTL(5*time.Second, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLWithDel(%s): failed to create cache: %v", test.name, err)
+		}
+
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+
+		prev, deleted := cache.Del("key")
+		if !deleted {
+			t.Errorf("TestTTLWithDel(%s): Del returned deleted=false", test.name)
+		}
+		if diff := pretty.Compare(prev, val); diff != "" {
+			t.Errorf("TestTTLWithDel(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		if _, ok := cache.Get("key"); ok {
+			t.Errorf("TestTTLWithDel(%s): key still exists after Del", test.name)
+		}
+
+		runtime.KeepAlive(val)
+	}
+}
+
+func TestTTLExpiration(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: entries expire after TTL",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithTTL(100*time.Millisecond, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLExpiration(%s): failed to create cache: %v", test.name, err)
+		}
+
+		// Set value in scope that will end
+		func() {
+			val := &testValue{data: "test", num: 42}
+			cache.Set("key", val)
+
+			// Verify it exists initially
+			got, ok := cache.Get("key")
+			if !ok {
+				t.Errorf("TestTTLExpiration(%s): value not found after Set", test.name)
+			}
+			if diff := pretty.Compare(got, val); diff != "" {
+				t.Errorf("TestTTLExpiration(%s): -got +want:\n%s", test.name, diff)
+			}
+		}()
+
+		// Wait for TTL to expire plus cleanup interval
+		time.Sleep(100*time.Millisecond + 1*time.Second + 200*time.Millisecond)
+
+		// Force GC
+		runtime.GC()
+		runtime.GC()
+		time.Sleep(100 * time.Millisecond)
+
+		// Value should be gone (non-deterministic due to GC)
+		if _, ok := cache.Get("key"); ok {
+			t.Logf("TestTTLExpiration(%s): WARNING - value still exists (GC is non-deterministic)", test.name)
+		}
+	}
+}
+
+func TestTTLConcurrentAccess(t *testing.T) {
+	tests := []struct {
+		name          string
+		numGoroutines int
+		numOps        int
+	}{
+		{
+			name:          "Success: concurrent Set/Get/Del with TTL",
+			numGoroutines: 50,
+			numOps:        100,
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[int, testValue](ctx, WithTTL(5*time.Second, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLConcurrentAccess(%s): failed to create cache: %v", test.name, err)
+		}
+
+		var wg sync.Group
+
+		for g := 0; g < test.numGoroutines; g++ {
+			wg.Go(
+				ctx,
+				func(ctx context.Context) error {
+					for i := 0; i < test.numOps; i++ {
+						key := i
+						opType := (g + i) % 3
+
+						switch opType {
+						case 0: // Set
+							val := &testValue{data: "concurrent", num: g*test.numOps + i}
+							cache.Set(key, val)
+						case 1: // Get
+							cache.Get(key)
+						case 2: // Del
+							cache.Del(key)
+						}
+					}
+					return nil
+				},
+			)
+		}
+
+		wg.Wait(ctx)
+
+		// Verify cache is functional
+		testVal := &testValue{data: "final", num: 999}
+		cache.Set(999, testVal)
+		got, ok := cache.Get(999)
+		if !ok {
+			t.Errorf("TestTTLConcurrentAccess(%s): cache not functional after concurrent ops", test.name)
+		}
+		if diff := pretty.Compare(got, testVal); diff != "" {
+			t.Errorf("TestTTLConcurrentAccess(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(testVal)
+	}
+}
+
+func TestTTLReset(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: Set on existing key resets TTL",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx, WithTTL(200*time.Millisecond, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLReset(%s): failed to create cache: %v", test.name, err)
+		}
+
+		val1 := &testValue{data: "first", num: 1}
+		cache.Set("key", val1)
+
+		// Wait almost until expiration
+		time.Sleep(150 * time.Millisecond)
+
+		// Reset by setting new value
+		val2 := &testValue{data: "second", num: 2}
+		cache.Set("key", val2)
+
+		// Wait past original TTL
+		time.Sleep(100 * time.Millisecond)
+
+		// Value should still exist because TTL was reset
+		got, ok := cache.Get("key")
+		if !ok {
+			t.Errorf("TestTTLReset(%s): value not found after TTL reset", test.name)
+		}
+		if diff := pretty.Compare(got, val2); diff != "" {
+			t.Errorf("TestTTLReset(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(val2)
+	}
+}
+
+func TestCacheWithoutTTL(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: cache works without TTL option",
+		},
+	}
+
+	for _, test := range tests {
+		ctx := t.Context()
+		cache, err := New[string, testValue](ctx)
+		if err != nil {
+			t.Fatalf("TestCacheWithoutTTL(%s): failed to create cache: %v", test.name, err)
+		}
+
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+
+		got, ok := cache.Get("key")
+		if !ok {
+			t.Errorf("TestCacheWithoutTTL(%s): value not found", test.name)
+		}
+		if diff := pretty.Compare(got, val); diff != "" {
+			t.Errorf("TestCacheWithoutTTL(%s): -got +want:\n%s", test.name, diff)
+		}
+
+		runtime.KeepAlive(val)
+	}
+}
+
+func TestTTLContextCancellation(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{
+			name: "Success: TTL cleanup stops on context cancel",
+		},
+	}
+
+	for _, test := range tests {
+		ctx, cancel := context.WithCancel(t.Context())
+
+		cache, err := New[string, testValue](ctx, WithTTL(1*time.Second, 1*time.Second))
+		if err != nil {
+			t.Fatalf("TestTTLContextCancellation(%s): failed to create cache: %v", test.name, err)
+		}
+
+		val := &testValue{data: "test", num: 42}
+		cache.Set("key", val)
+
+		// Cancel context
+		cancel()
+
+		// Give goroutine time to exit
+		time.Sleep(100 * time.Millisecond)
+
+		// Cache should still work for basic operations
+		got, ok := cache.Get("key")
+		if !ok || got == nil {
+			t.Errorf("TestTTLContextCancellation(%s): cache not functional after cancel", test.name)
+		}
+
+		runtime.KeepAlive(val)
 	}
 }

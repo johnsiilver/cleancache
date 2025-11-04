@@ -100,7 +100,8 @@ func (c *Cache[K, V]) Set(k K, v *V) (Prev *V, ok bool) {
 	return oldV, ok
 }
 
-// delete removes a planID from the cache.
+// Del deletes a value for a key.
+// Returns the deleted value, or false when no value was assigned.
 func (c *Cache[K, V]) Del(k K) (prev *V, ok bool) {
 	if c == nil || c.shardedMap == nil {
 		return
