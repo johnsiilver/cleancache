@@ -1,8 +1,8 @@
 // Package cleancache provides a thread-safe weak pointer cache that automatically cleans up entries
-// when the weakly referenced objects are garbage collected. It supports basic operations like Get, Set,
-// CompareAndSwap, and CompareAndDelete, with customizable equality checks. It uses a shared map for concurrency
-// that also shrinks with deleted keys. The sharded map is based on Tidwall's shardedmap implementation, but updated for
-// generics and uses the maphash package. The cache has no size limit and relies on Go's runtime to manage memory
+// when the weakly referenced objects are garbage collected. It supports basic operations like Get, Set and Del.
+// It uses a shared map for concurrency that also shrinks with deleted keys. The sharded map is based on
+// Tidwall's shardedmap implementation, but updated for generics and uses the maphash package.
+// The cache has no size limit and relies on Go's runtime to manage memory
 // once objects are no longer referenced. This uses a custom version of github.com/gostdlib/concurrency/sync's shardedmap
 // for slightly better performance.
 package cleancache
