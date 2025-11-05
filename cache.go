@@ -32,7 +32,6 @@ type Cache[K comparable, V any] struct {
 	interval   time.Duration
 	useFlights bool
 	getFlight  singleflight.Group[K, struct{}]
-	setFlight  singleflight.Group[K, struct{}]
 
 	ttlLock sync.Mutex
 	ttlMap  hashmap.Map[K, ttlEntry[V]]
